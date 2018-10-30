@@ -25,17 +25,15 @@ class findFaceGetPulse(object):
         self.frame_in = np.zeros((10, 10))
         self.frame_out = np.zeros((10, 10))
         self.fps = 0
-        self.buffer_size = 250
-        #self.window = np.hamming(self.buffer_size)
+        self.buffer_size = 300 # 30 fps for 10 seconds
+        self.hamming_window = np.hamming(self.buffer_size)
         self.data_buffer = []
         self.times = []
-        self.ttimes = []
         self.samples = []
         self.freqs = []
         self.fft = []
         self.slices = [[0]]
         self.t0 = time.time()
-        self.bpms = []
         self.bpm = 0
         dpath = resource_path("haarcascade_frontalface_alt.xml")
         if not os.path.exists(dpath):
@@ -44,19 +42,14 @@ class findFaceGetPulse(object):
 
         self.face_rect = [1, 1, 2, 2]
         self.last_center = np.array([0, 0])
-        self.last_wh = np.array([0, 0])
-        self.output_dim = 13
-        self.trained = False
 
-        self.idx = 1
         self.find_faces = True
+        # time gap to wait before bpm can be measured
+        self.gap = 0
 
     def find_faces_toggle(self):
         self.find_faces = not self.find_faces
         return self.find_faces
-
-    def get_faces(self):
-        return
 
     def shift(self, detected):
         x, y, w, h = detected
@@ -65,6 +58,7 @@ class findFaceGetPulse(object):
 
         self.last_center = center
         return shift
+
 
     def draw_rect(self, rect, col=(0, 255, 0)):
         x, y, w, h = rect
@@ -77,162 +71,195 @@ class findFaceGetPulse(object):
                 int(w * fh_w),
                 int(h * fh_h)]
 
+    def getForehead(self):
+        return self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
+
     def get_subface_means(self, coord):
         x, y, w, h = coord
         subframe = self.frame_in[y:y + h, x:x + w, :]
-        v1 = np.mean(subframe[:, :, 0])
-        v2 = np.mean(subframe[:, :, 1])
-        v3 = np.mean(subframe[:, :, 2])
 
-        return (v1 + v2 + v3) / 3.
+    	# Oxydized hemoglobin (HbO2) absorbs more green light and reflects more red.
+        # Deoxydized hemoglobin (HbCO) absorbs more red light and reflects more green.
+        # At the moment of pulsation, saturation of HbO2 is maximal and saturation of HbCO is minimal.
+        # Note that HbCO contribution to absorbance can be neglected,
+        # because it is present in a smaller concentration (>94% of HbO2 and <2% of HbCO).
+        # More noise will be present at shorter wavelengths, particularly in blue channel:
+        #   - The ability of light to pass through skin decreases with shorter wavelengths.
+        #   - Absorption coefficients vary a lot for blue channel:
+        #       there is a distinctive peak at 425nm with e=130cm2/mol, and there are values as low as 6cm2/mol at 490nm,
+        #       which makes it hard to determine mean absorption rate for this channel
+    	# See B.L.Horecker [http://www.jbc.org/content/148/1/173.full.pdf] and similar studies for more details.
 
-    def train(self):
-        self.trained = not self.trained
-        return self.trained
+        # The coefficients below are estimated empirically, by examining results of hemoglobin spectrography studies
+        HBO2_MEAN_ABSORBPTION_RATE_GREEN    = 0.82
+        HBO2_MEAN_ABSORBPTION_RATE_RED      = 0.3
 
-    def plot(self):
-        data = np.array(self.data_buffer).T
-        np.savetxt("data.dat", data)
-        np.savetxt("times.dat", self.times)
-        freqs = 60. * self.freqs
-        idx = np.where((freqs > 50) & (freqs < 180))
-        pylab.figure()
-        n = data.shape[0]
-        for k in xrange(n):
-            pylab.subplot(n, 1, k + 1)
-            pylab.plot(self.times, data[k])
-        pylab.savefig("data.png")
-        pylab.figure()
-        for k in xrange(self.output_dim):
-            pylab.subplot(self.output_dim, 1, k + 1)
-            pylab.plot(self.times, self.pcadata[k])
-        pylab.savefig("data_pca.png")
+        b = np.mean(subframe[:, :, 0])
+        g = np.mean(subframe[:, :, 1]) * HBO2_MEAN_ABSORBPTION_RATE_GREEN
+        r = np.mean(subframe[:, :, 2]) * HBO2_MEAN_ABSORBPTION_RATE_RED
 
-        pylab.figure()
-        for k in xrange(self.output_dim):
-            pylab.subplot(self.output_dim, 1, k + 1)
-            pylab.plot(freqs[idx], self.fft[k][idx])
-        pylab.savefig("data_fft.png")
-        quit()
+        return (g + r)
+
+    def drawText(self, text, pos, scale=1.25):
+        textColor = (100, 255, 100)
+        cv2.putText(self.frame_out, text, pos, cv2.FONT_HERSHEY_PLAIN, scale, textColor)
+        return
+
+    def drawMenu(self, cameraStr):
+        pos = [10, 25] # starting menu text coordinates
+        lineHeight = 25
+        menuText = ("Press 'C' to change camera (current: %s)" % cameraStr,
+                    "Press 'S' to lock face and begin",
+                    "Press 'D' to toggle data plot",
+                    "Press 'Esc' to quit")
+        if self.find_faces: # enable data plot only when face is detected
+            menuText = menuText[0:1] + menuText[3:]
+        for text in menuText:
+            self.drawText(text, tuple(pos))
+            pos[1] += lineHeight
+        return
+
+    def drawFaceRect(self):
+        x,y,w,h = self.getForehead()
+        self.draw_rect([x,y,w,h], (0, 255, 0))
+
+        if self.find_faces:
+            self.drawText("Forehead", (x, y), 1.5)
+            self.draw_rect(self.face_rect, (255, 0, 0))
+            x, y, w, h = self.face_rect
+            self.drawText("Face", (x, y), 1.5)
+        else:
+            text = "estimate: %0.0f bpm" % (self.bpm)
+            if self.gap:
+                text += ", wait %0.0f s" % self.gap
+            self.drawText(text, (int(x - w / 2), int(y)), 1)
+        return
+
+    def findFaces(self):
+        self.data_buffer, self.times = [], []
+        detected = list(
+                self.face_cascade.detectMultiScale(
+                        self.gray,
+                        scaleFactor=1.3,
+                        minNeighbors=4,
+                        minSize=(50, 50),
+                        flags=cv2.CASCADE_SCALE_IMAGE
+                    )
+            )
+
+        if len(detected) > 0:
+            # sort found faces, we need only the best match
+            detected.sort(key=lambda a: a[-1] * a[-2])
+            # set face rectangle to the found face only
+            # if it is away from the last detected for more than 10px -
+            # this allows some head movement in the frame without triggering
+            # face detection too much
+            if self.shift(detected[-1]) > 10:
+                self.face_rect = detected[-1]
+
+    ''' Adds mean color values from forehead to the buffer.
+        Returns True if there is enough data gathered '''
+    def gatherColorIntensityData(self):
+        vals = self.get_subface_means(self.getForehead())
+
+        self.data_buffer.append(vals)
+        buffer_len = len(self.data_buffer)
+        if buffer_len > self.buffer_size:
+            self.data_buffer = self.data_buffer[-self.buffer_size:]
+            self.times = self.times[-self.buffer_size:]
+            buffer_len = self.buffer_size
+        elif buffer_len < self.buffer_size:
+            return False
+        return True
 
     def run(self, cam):
         self.times.append(time.time() - self.t0)
         self.frame_out = self.frame_in
-        self.gray = cv2.equalizeHist(cv2.cvtColor(self.frame_in,
-                                                  cv2.COLOR_BGR2GRAY))
-        col = (100, 255, 100)
+        self.gray = cv2.equalizeHist(
+                cv2.cvtColor(self.frame_in, cv2.COLOR_BGR2GRAY)
+            )
+
+        self.drawMenu(str(cam))
+        self.drawFaceRect()
+
         if self.find_faces:
-            cv2.putText(
-                self.frame_out, "Press 'C' to change camera (current: %s)" % str(
-                    cam),
-                (10, 25), cv2.FONT_HERSHEY_PLAIN, 1.25, col)
-            cv2.putText(
-                self.frame_out, "Press 'S' to lock face and begin",
-                       (10, 50), cv2.FONT_HERSHEY_PLAIN, 1.25, col)
-            cv2.putText(self.frame_out, "Press 'Esc' to quit",
-                       (10, 75), cv2.FONT_HERSHEY_PLAIN, 1.25, col)
-            self.data_buffer, self.times, self.trained = [], [], False
-            detected = list(self.face_cascade.detectMultiScale(self.gray,
-                                                               scaleFactor=1.3,
-                                                               minNeighbors=4,
-                                                               minSize=(
-                                                                   50, 50),
-                                                               flags=cv2.CASCADE_SCALE_IMAGE))
-
-            if len(detected) > 0:
-                detected.sort(key=lambda a: a[-1] * a[-2])
-
-                if self.shift(detected[-1]) > 10:
-                    self.face_rect = detected[-1]
-            forehead1 = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
-            self.draw_rect(self.face_rect, col=(255, 0, 0))
-            x, y, w, h = self.face_rect
-            cv2.putText(self.frame_out, "Face",
-                       (x, y), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
-            self.draw_rect(forehead1)
-            x, y, w, h = forehead1
-            cv2.putText(self.frame_out, "Forehead",
-                       (x, y), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
+            # face detection not yet done
+            self.findFaces()
             return
-        if set(self.face_rect) == set([1, 1, 2, 2]):
-            return
-        cv2.putText(
-            self.frame_out, "Press 'C' to change camera (current: %s)" % str(
-                cam),
-            (10, 25), cv2.FONT_HERSHEY_PLAIN, 1.25, col)
-        cv2.putText(
-            self.frame_out, "Press 'S' to restart",
-                   (10, 50), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
-        cv2.putText(self.frame_out, "Press 'D' to toggle data plot",
-                   (10, 75), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
-        cv2.putText(self.frame_out, "Press 'Esc' to quit",
-                   (10, 100), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
 
-        forehead1 = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
-        self.draw_rect(forehead1)
-
-        vals = self.get_subface_means(forehead1)
-
-        self.data_buffer.append(vals)
-        L = len(self.data_buffer)
-        if L > self.buffer_size:
-            self.data_buffer = self.data_buffer[-self.buffer_size:]
-            self.times = self.times[-self.buffer_size:]
-            L = self.buffer_size
-
+        dataGathered = self.gatherColorIntensityData()
         processed = np.array(self.data_buffer)
         self.samples = processed
-        if L > 10:
-            self.output_dim = processed.shape[0]
+        buffer_len = len(self.data_buffer)
 
-            self.fps = float(L) / (self.times[-1] - self.times[0])
-            even_times = np.linspace(self.times[0], self.times[-1], L)
-            interpolated = np.interp(even_times, self.times, processed)
-            interpolated = np.hamming(L) * interpolated
-            interpolated = interpolated - np.mean(interpolated)
-            raw = np.fft.rfft(interpolated)
-            phase = np.angle(raw)
-            self.fft = np.abs(raw)
-            self.freqs = float(self.fps) / L * np.arange(L / 2 + 1)
+        if len(self.times) > 1:
+            self.fps = float(buffer_len) / (self.times[-1] - self.times[0])
+            self.gap = (self.buffer_size - buffer_len) / self.fps
 
-            freqs = 60. * self.freqs
-            idx = np.where((freqs > 50) & (freqs < 180))
+        if not dataGathered:
+            return
 
-            pruned = self.fft[idx]
-            phase = phase[idx]
+        # evenly space numbers from beginning to current time - on L spaces
+        even_times = np.linspace(self.times[0], self.times[-1], buffer_len)
 
-            pfreq = freqs[idx]
-            self.freqs = pfreq
-            self.fft = pruned
-            idx2 = np.argmax(pruned)
+        # interpolate even_times to processed based on self.times->processed map
+        interpolated = np.interp(even_times, self.times, processed)
 
-            t = (np.sin(phase[idx2]) + 1.) / 2.
-            t = 0.9 * t + 0.1
-            alpha = t
-            beta = 1 - t
+        # apply Hamming window function (for L points in the result)
+        # to select only the area of interest in the signal and smoothen it
+        interpolated = self.hamming_window * interpolated
 
-            self.bpm = self.freqs[idx2]
-            self.idx += 1
+        # remove mean value from interpolated (simple denoise)
+        interpolated = interpolated - np.mean(interpolated)
 
-            x, y, w, h = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
-            r = alpha * self.frame_in[y:y + h, x:x + w, 0]
-            g = alpha * \
-                self.frame_in[y:y + h, x:x + w, 1] + \
+        # Fourier transformation to amplify the signal
+        rawfft = np.fft.rfft(interpolated)
+
+        # convert transformed signal to radians
+        phase = np.angle(rawfft)
+        # remove negative values from the transformed signal
+        self.fft = np.abs(rawfft)
+
+        self.freqs = float(self.fps) / buffer_len * np.arange(buffer_len / 2 + 1)
+        self.freqs = 60. * self.freqs # freqs per minute
+
+        idx = np.where((self.freqs > 40) & (self.freqs < 150))
+
+        # select only that area of the signal (in radians) where freqs are in target bpm limits
+        self.fft = self.fft[idx]
+        phase = phase[idx]
+        self.freqs = self.freqs[idx]
+
+        max_val_indices = np.argmax(self.fft)
+
+        # get sin of signal in radians [-1;1], and project values to [0;1]
+        t = (np.sin(phase[max_val_indices]) + 1.) / 2.
+        # split value to two compounds: alpha [0.1;1] and beta [0;0.9]
+        # alpha+beta=1:
+        #    the smaller is alpha, the bigger is beta and vice versa
+        #    the bigger is t, the bigger is alpha
+        #    beta will show maximums from sin, and will be added to the green channel
+        t = 0.9 * t + 0.1
+        alpha = t
+        beta = 1 - t
+
+        self.bpm = self.freqs[max_val_indices]
+
+        x, y, w, h = self.getForehead()
+        b = alpha * self.frame_in[y:y + h, x:x + w, 0]
+        g = alpha * self.frame_in[y:y + h, x:x + w, 1] + \
                 beta * self.gray[y:y + h, x:x + w]
-            b = alpha * self.frame_in[y:y + h, x:x + w, 2]
-            self.frame_out[y:y + h, x:x + w] = cv2.merge([r,
-                                                          g,
-                                                          b])
-            x1, y1, w1, h1 = self.face_rect
-            self.slices = [np.copy(self.frame_out[y1:y1 + h1, x1:x1 + w1, 1])]
-            col = (100, 255, 100)
-            gap = (self.buffer_size - L) / self.fps
-            # self.bpms.append(bpm)
-            # self.ttimes.append(time.time())
-            if gap:
-                text = "(estimate: %0.1f bpm, wait %0.0f s)" % (self.bpm, gap)
-            else:
-                text = "(estimate: %0.1f bpm)" % (self.bpm)
-            tsize = 1
-            cv2.putText(self.frame_out, text,
-                       (int(x - w / 2), int(y)), cv2.FONT_HERSHEY_PLAIN, tsize, col)
+        r = alpha * self.frame_in[y:y + h, x:x + w, 2]
+        self.frame_out[y:y + h, x:x + w] = cv2.merge([b,g,r])
+
+        # copy image to the plot window
+        face_x, face_y, face_w, face_h = self.face_rect
+        self.slices = [
+                np.copy(
+                        self.frame_out[
+                                face_y:face_y + face_h,
+                                face_x:face_x + face_w,
+                                1
+                            ]
+                    )
+            ]
