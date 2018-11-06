@@ -1,10 +1,13 @@
 import numpy as np
+import scipy
 import time
 import cv2
 import pylab
 import os
 import sys
-
+import eulerian_magnification as em
+import threading as th
+import time as t
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -46,6 +49,8 @@ class findFaceGetPulse(object):
         self.find_faces = True
         # time gap to wait before bpm can be measured
         self.gap = 0
+        # thread for doing evm in background
+        self.evmThread = []
 
     def find_faces_toggle(self):
         self.find_faces = not self.find_faces
@@ -160,9 +165,9 @@ class findFaceGetPulse(object):
     ''' Adds mean color values from forehead to the buffer.
         Returns True if there is enough data gathered '''
     def gatherColorIntensityData(self):
-        vals = self.get_subface_means(self.getForehead())
+        #vals = self.get_subface_means(self.getForehead())
 
-        self.data_buffer.append(vals)
+        self.data_buffer.append(self.frame_in)
         buffer_len = len(self.data_buffer)
         if buffer_len > self.buffer_size:
             self.data_buffer = self.data_buffer[-self.buffer_size:]
@@ -179,17 +184,17 @@ class findFaceGetPulse(object):
                 cv2.cvtColor(self.frame_in, cv2.COLOR_BGR2GRAY)
             )
 
-        self.drawMenu(str(cam))
-        self.drawFaceRect()
+        #self.drawMenu(str(cam))
+        #self.drawFaceRect()
 
-        if self.find_faces:
+        #if self.find_faces:
             # face detection not yet done
-            self.findFaces()
-            return
+        #    self.findFaces()
+        #    return
 
         dataGathered = self.gatherColorIntensityData()
-        processed = np.array(self.data_buffer)
-        self.samples = processed
+        #processed = np.array(self.data_buffer)
+        #self.samples = processed
         buffer_len = len(self.data_buffer)
 
         if len(self.times) > 1:
@@ -197,69 +202,167 @@ class findFaceGetPulse(object):
             self.gap = (self.buffer_size - buffer_len) / self.fps
 
         if not dataGathered:
+            self.evmThread = th.Thread(
+                    target = self.eulerian_magnification,
+                    args = (np.array(self.data_buffer), self.fps, 0.98, 1.35, 100, 4, )
+                )
             return
 
-        # evenly space numbers from beginning to current time - on L spaces
-        even_times = np.linspace(self.times[0], self.times[-1], buffer_len)
+        vid = self.load_video_float(np.array(self.data_buffer))
+        #em.show_frequencies(vid, fps);
 
-        # interpolate even_times to processed based on self.times->processed map
-        interpolated = np.interp(even_times, self.times, processed)
+        #self.save_video(vid, self.fps, 'C:\\work\\input.avi')
 
-        # apply Hamming window function (for L points in the result)
-        # to select only the area of interest in the signal and smoothen it
-        interpolated = self.hamming_window * interpolated
+        if  self.evmThread.is_alive():
+            self.evmThread.join()
+        self.evmThread = th.Thread(
+                target = self.eulerian_magnification,
+                args = (vid, self.fps, 0.98, 1.35, 100, 4, )
+            )
+        self.evmThread.start()
 
-        # remove mean value from interpolated (simple denoise)
-        interpolated = interpolated - np.mean(interpolated)
+        #todo: count pulse from signal
+        #self.save_video(vid, self.fps, 'C:\\work\\output.avi')
+        #self.frame_out = vid[0]
 
-        # Fourier transformation to amplify the signal
-        rawfft = np.fft.rfft(interpolated)
+    def create_laplacian_video_pyramid(self, video, pyramid_levels):
+        return self._create_pyramid(video, pyramid_levels, self.create_laplacian_image_pyramid)
 
-        # convert transformed signal to radians
-        phase = np.angle(rawfft)
-        # remove negative values from the transformed signal
-        self.fft = np.abs(rawfft)
+    def _create_pyramid(self, video, pyramid_levels, pyramid_fn):
+        vid_pyramid = []
+        # frame_count, height, width, colors = video.shape
+        for frame_number, frame in enumerate(video):
+            frame_pyramid = pyramid_fn(frame, pyramid_levels)
 
-        self.freqs = float(self.fps) / buffer_len * np.arange(buffer_len / 2 + 1)
-        self.freqs = 60. * self.freqs # freqs per minute
+            for pyramid_level, pyramid_sub_frame in enumerate(frame_pyramid):
+                if frame_number == 0:
+                    vid_pyramid.append(
+                        np.zeros((video.shape[0], pyramid_sub_frame.shape[0], pyramid_sub_frame.shape[1], 3),
+                                    dtype="float"))
 
-        idx = np.where((self.freqs > 40) & (self.freqs < 150))
+                vid_pyramid[pyramid_level][frame_number] = pyramid_sub_frame
 
-        # select only that area of the signal (in radians) where freqs are in target bpm limits
-        self.fft = self.fft[idx]
-        phase = phase[idx]
-        self.freqs = self.freqs[idx]
+        return vid_pyramid
 
-        max_val_indices = np.argmax(self.fft)
+    def create_gaussian_video_pyramid(self, video, pyramid_levels):
+        return self._create_pyramid(video, pyramid_levels, self.create_gaussian_image_pyramid)
 
-        # get sin of signal in radians [-1;1], and project values to [0;1]
-        t = (np.sin(phase[max_val_indices]) + 1.) / 2.
-        # split value to two compounds: alpha [0.1;1] and beta [0;0.9]
-        # alpha+beta=1:
-        #    the smaller is alpha, the bigger is beta and vice versa
-        #    the bigger is t, the bigger is alpha
-        #    beta will show maximums from sin, and will be added to the green channel
-        t = 0.9 * t + 0.1
-        alpha = t
-        beta = 1 - t
+    def create_laplacian_image_pyramid(self, image, pyramid_levels):
+        gauss_pyramid = self.create_gaussian_image_pyramid(image, pyramid_levels)
+        laplacian_pyramid = []
+        for i in range(pyramid_levels - 1):
+            laplacian_pyramid.append((gauss_pyramid[i] - cv2.pyrUp(gauss_pyramid[i + 1])) + 0)
 
-        self.bpm = self.freqs[max_val_indices]
+        laplacian_pyramid.append(gauss_pyramid[-1])
+        return laplacian_pyramid
 
-        x, y, w, h = self.getForehead()
-        b = alpha * self.frame_in[y:y + h, x:x + w, 0]
-        g = alpha * self.frame_in[y:y + h, x:x + w, 1] + \
-                beta * self.gray[y:y + h, x:x + w]
-        r = alpha * self.frame_in[y:y + h, x:x + w, 2]
-        self.frame_out[y:y + h, x:x + w] = cv2.merge([b,g,r])
+    def create_gaussian_image_pyramid(self, image, pyramid_levels):
+        gauss_copy = np.ndarray(shape=image.shape, dtype="float")
+        #print("gauss copy", gauss_copy)
+        gauss_copy[:] = image
+        img_pyramid = [gauss_copy]
+        for pyramid_level in range(1, pyramid_levels):
+            gauss_copy = cv2.pyrDown(gauss_copy)
+            img_pyramid.append(gauss_copy)
 
-        # copy image to the plot window
-        face_x, face_y, face_w, face_h = self.face_rect
-        self.slices = [
-                np.copy(
-                        self.frame_out[
-                                face_y:face_y + face_h,
-                                face_x:face_x + face_w,
-                                1
-                            ]
-                    )
-            ]
+        return img_pyramid
+
+    def temporal_bandpass_filter(self, data, fps, freq_min=0.833, freq_max=1, axis=0, amplification_factor=1):
+        print("Applying bandpass between " + str(freq_min) + " and " + str(freq_max) + " Hz")
+        fft = scipy.fftpack.rfft(data, axis=axis)
+        frequencies = scipy.fftpack.fftfreq(data.shape[0], d=1.0 / fps)
+        bound_low = (np.abs(frequencies - freq_min)).argmin()
+        bound_high = (np.abs(frequencies - freq_max)).argmin()
+        fft[:bound_low] = 0
+        fft[bound_high:-bound_high] = 0
+        fft[-bound_low:] = 0
+
+        result = np.ndarray(shape=data.shape, dtype='float')
+        result[:] = scipy.fftpack.ifft(fft, axis=0)
+        result *= amplification_factor
+        return result
+
+    def online_riesz_video_magnification(amplification_factor, low_cutoff, high_cutoff, sampling_rate):
+        nyquist_frequence = sampling_rate / 2;
+        temporal_filter_order = 1;
+        b,a = getButterworthFilterCoefficients(..)
+
+        gaussian_kernel_sd = 2 # 2px
+        gaussian_kernel = getGaussianKernel(gaussian_kernel_sd)
+
+        previous_frame = getFirstFrameFromVideo()
+        previous_laplacian_pyramid, previous_riesz_x, previous_riedz_y = computeRieszPyramid(previous_frame)
+        number_of_levels = numel(previous_laplacian_pyramid) - 1
+        for k in range (1, number_of_levels):
+            phase_cos[k] = np.zeros(size(previous_laplacian_pyramid[k]))
+            phase_sin[k] = np.zeros(size(previous_laplacian_pyramid[k]))
+            register0_cos[k] = np.zeros(size(previous_laplacian_pyramid[k]))
+            register1_cos[k] = np.zeros(size(previous_laplacian_pyramid[k]))
+            register0_sin[k] = np.zeros(size(previous_laplacian_pyramid[k]))
+            register1_sin[k] = np.zeros(size(previous_laplacian_pyramid[k]))
+
+
+
+
+    def eulerian_magnification(self, vid_data, fps, freq_min, freq_max, amplification, pyramid_levels=4, skip_levels_at_top=2):
+        print("Started EVM for " + str(freq_min) + " and " + str(freq_max) + " Hz")
+        vid_pyramid = self.create_laplacian_video_pyramid(vid_data, pyramid_levels=pyramid_levels)
+        for i, vid in enumerate(vid_pyramid):
+            if i < skip_levels_at_top or i >= len(vid_pyramid) - 1:
+                # ignore the top and bottom of the pyramid. One end has too much noise and the other end is the
+                # gaussian representation
+                continue
+
+            bandpassed = self.temporal_bandpass_filter(vid, fps, freq_min=freq_min, freq_max=freq_max, amplification_factor=amplification)
+
+            # play_vid_data(bandpassed)
+
+            vid_pyramid[i] += bandpassed
+            t.sleep(1)
+
+        vid_data = self.collapse_laplacian_video_pyramid(vid_pyramid)
+        return vid_data
+
+    def save_video(self, video, fps, save_filename='C:\\work\\output.avi'):
+        """Save a video to disk"""
+        # fourcc = cv2.CAP_PROP_FOURCC('M', 'J', 'P', 'G')
+        print("saving file: " + save_filename)
+        video = self.float_to_uint8(video)
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        print("video.shape ", video.shape)
+        writer = cv2.VideoWriter(save_filename, fourcc, fps, (video.shape[2], video.shape[1]), 1)
+        for x in range(0, video.shape[0]):
+            res = cv2.convertScaleAbs(video[x])
+            writer.write(res)
+        writer.release()
+
+    def float_to_uint8(self, img):
+        result = np.ndarray(shape=img.shape, dtype='uint8')
+        result[:] = img * 255
+        return result
+
+    def collapse_laplacian_pyramid(self, image_pyramid):
+        img = image_pyramid.pop()
+        while image_pyramid:
+            img = cv2.pyrUp(img) + (image_pyramid.pop() - 0)
+
+        return img
+
+    def collapse_laplacian_video_pyramid(self, pyramid):
+        i = 0
+        while True:
+            try:
+                img_pyramid = [vid[i] for vid in pyramid]
+                pyramid[0][i] = self.collapse_laplacian_pyramid(img_pyramid)
+                i += 1
+            except IndexError:
+                break
+        return pyramid[0]
+
+    def load_video_float(self, video):
+        return self.uint8_to_float(video)
+
+    def uint8_to_float(self, img):
+        result = np.ndarray(shape=img.shape, dtype='float')
+        result[:] = img * (1. / 255)
+        return result
