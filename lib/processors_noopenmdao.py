@@ -285,7 +285,8 @@ class findFaceGetPulse(object):
     def online_riesz_video_magnification(amplification_factor, low_cutoff, high_cutoff, sampling_rate):
         nyquist_frequence = sampling_rate / 2;
         temporal_filter_order = 1;
-        b,a = getButterworthFilterCoefficients(..)
+        #b,a = getButterworthFilterCoefficients(..)
+        b,a = self.IIRTemporalFilter
 
         gaussian_kernel_sd = 2 # 2px
         gaussian_kernel = getGaussianKernel(gaussian_kernel_sd)
@@ -301,8 +302,176 @@ class findFaceGetPulse(object):
             register0_sin[k] = np.zeros(size(previous_laplacian_pyramid[k]))
             register1_sin[k] = np.zeros(size(previous_laplacian_pyramid[k]))
 
+        while running:
+            current frame = GetNextFrameFromVideo()
+            current laplacian pyramid, current riesz x, current riesz y = ComputeRieszPyramid(current frame)
 
+            # We compute a Laplacian pyramid of the motion magnified frame first and then
+            # collapse it at the end.
+            # The processing in the following loop is processed on each level
+            # of the Riesz pyramid independently
+            for k in range (1, number_of_levels):
+                # Compute quaternionic phase difference between current Riesz pyramid
+                # coefficients and previous Riesz pyramid coefficients.
+                phase_difference_cos, phase_difference_sin, amplitude = ComputePhaseDifferenceAndAmplitude(
+                        current_laplacian_pyramid[k],
+                        current_riesz_x[k],
+                        current_riesz_y[k],
+                        previous_laplacian_pyramid[k],
+                        previous_riesz_x[k],
+                        previous_riesz_y[k]
+                )
 
+                # Adds the quaternionic phase difference to the current value of the quaternionic
+                # phase.
+                # Computing the current value of the phase in this way is
+                # equivalent to phase unwrapping.
+                phase_cos[k] = phase_cos[k] + phase_difference_cos
+                phase_sin[k] = phase_sin[k] + phase_difference_sin
+
+                # Temporally filter the quaternionic phase using current value and stored
+                # information
+
+                phase_filtered_cos, register0_cos[k], register1_cos[k] = IIRTemporalFilter(
+                        B, A, phase_cos[k], register0_cos[k], register1_cos[k]
+                    )
+                phase_filtered_sin, register0_sin[k], register1_sin[k] = IIRTemporalFilter(
+                        B, A, phase_sin[k], register0_sin[k], register1_sin[k]
+                    )
+
+                # Spatial blur the temporally filtered quaternionic phase signals.
+                # This is not an optional step. In addition to denoising,
+                # it smooths out errors made during the various approximations.
+                phase_filtered_cos = AmplitudeWeightedBlur(phase_filtered_cos, amplitude, gaussian_kernel)
+                phase_filtered_sin = AmplitudeWeightedBlur(phase filtered sin, amplitude, gaussian kernel)
+
+                # The motion magnified pyramid is computed by phase shifting
+                # the input pyramid by the spatio-temporally filtered quaternionic phase and
+                # taking the real part.
+                phase_magnified_filtered_cos = amplification_factor * phase_filtered_cos
+                phase_magnified_filtered_sin = amplification_factor * phase_filtered_sin
+
+                motion_magnified_laplacian_pyramid[k] = PhaseShiftCoefficientRealPart(
+                        current_laplacian_pyramid[k],
+                        current_riesz_x[k],
+                        current_riesz_y[k],
+                        phase_magnified_filtered_cos,
+                        phase_magnified_filtered_sin
+                    )
+
+            # Take lowpass residual from current frame's lowpass residual
+            # and collapse pyramid.
+            motion_magnified_laplacian_pyramid[number_of_levels+1] = current_laplacian_pyramid[number_of_levels+1]
+            motion_magnified_frame = CollapseLaplacianPyramid(motion_magnified_laplacian_pyramid);
+
+            # Write or display the motion magnified frame.
+            WriteMagnifiedFrame(motion_magnified_frame);
+            # DisplayMagnifiedFrame(motion_magnified_frame);
+
+            # Prepare for next iteration of loop
+            previous_laplacian_pyramid = current_laplacian_pyramid;
+            previous_riesz_x = current_riesz_x;
+            previous_riesz_y = current_riesz_y;
+
+        def ComputeRieszPyramid(grayscale_frame):
+            # Compute Riesz pyramid of two dimensional frame. This is done by first
+            # computing the laplacian pyramid of the frame and then computing the
+            # approximate Riesz transform of each level that is not the lowpass
+            # residual. The result is stored as an array of grayscale frames.
+            # Corresponding locations in the result correspond to the real,
+            # i and j components of Riesz pyramid coefficients.
+            laplacian_pyramid = ComputeLaplacianPyramid(grayscale_frame)
+            number_of_levels = numel(laplacian_pyramid)-1
+
+            # The approximate Riesz transform of each level that is not the
+            # low pass residual is computed. For more details on the approximation,
+            # see supplemental material.
+            kernel_x = [0.0, 0.0, 0.0,
+                        0.5, 0.0, -0.5,
+                        0.0, 0.0, 0.0]
+            kernel_y = [0.0, 0.5, 0.0,
+                        0.0, 0.0, 0.0,
+                        0.0, -0.5, 0.0]
+            for k in range(1,number_of_levels):
+                riesz_x[k] = Convolve(laplacian_pyramid[k], kernel_x)
+                riesz_y[k] = Convolve(laplacian_pyramid[k], kernel_y)
+        return laplacian_pyramid, riesz_x, riesz_y
+
+    def ComputePhaseDifferenceAndAmplitude(current_real, current_x, current_y, previous_real, previous_x, previous_y):
+        # Computes quaternionic phase difference between current frame and previous
+        # frame. This is done by dividing the coefficients of the current frame
+        # and the previous frame and then taking imaginary part of the quaternionic
+        # logarithm. We assume the orientation at a point is roughly constant to
+        # simplify the calcuation.
+
+        # q current = current real + i * current x + j * current y
+        # q previous = previous real + i * previous x + j * previous y
+        # We want to compute the phase difference, which is the phase of
+        # q current/q previous
+        # This is equal to (Eq. 10 of tech. report)
+        # q current * conjugate(q previous) /||q previous||ˆ 2
+        # Phase is invariant to scalar multiples, so we want the phase of
+        # q current * conjugate(q previous)
+        # which we compute now (Eq. 7 of tech. report). Under the constant orientation assumption,
+        # we can assume the fourth component of the product is zero.
+        q_conj_prod_real = current_real. * previous_real + current_x.*previous_x + current_y.*previous_y
+        q_conj_prod_x = -current_real.*previous_x + previous_real.*current_x
+        q_conj_prod_y = -current_real.*previous_y + previous_real.*current_y
+
+        # Now we take the quaternion logarithm of this (Eq. 12 in tech. report)
+        # Only the imaginary part corresponds to quaternionic phase.
+        q_conj_prod_amplitude = sqrt(q_conj_prod_real.ˆ2 + q_conj_prod_x.ˆ2 + q_conj_prod_y.ˆ2)
+        phase_difference = acos(q_conj_prod_real./q_conj_prod_amplitude)
+        cos_orientation = q_conj_prod_x ./ sqrt(q_conj_prod_x.ˆ2+q_conj_prod_y.ˆ2)
+        sin_orientation = q_conj_prod_y ./ sqrt(q_conj_prod_x.ˆ2+q_conj_prod_y.ˆ2)
+
+        # This is the quaternionic phase (Eq. 2 in tech. report)
+        phase_difference_cos = phase_difference .* cos_orientation
+        phase_difference_sin = phase_difference .* sin_orientation
+
+        # Under the assumption that changes are small between frames, we can
+        # assume that the amplitude of both coefficients is the same. So,
+        # to compute the amplitude of one coefficient, we just take the square root
+        #
+        amplitude = sqrt(q_conj_prod_amplitude);
+
+        return phase_difference_cos, phase_difference_sin, amplitude
+
+    def IIRTemporalFilter(B, A, phase, register0, register1):
+        # Temporally filters phase with IIR filter with coefficients B, A.
+        # Given current phase value and value of previously computed registers,
+        # comptues current temporally filtered phase value and updates registers.
+        # Assumes filter given by B, A is first order IIR filter, so that
+        # B and A have 3 coefficients each. Also, assumes A(1) = 1. Computation
+        # is Direct Form Type II (See pages 388-390 of Oppenheim and Schafer 3rd Ed.)
+        temporally_filtered_phase = B(1) * phase + register0
+        register0 = B(2) * phase + register1 - A(2) * temporally filtered phase
+        register1 = B(3) * phase - A(3) * temporally filtered phase
+        return temporally_filtered_phase, register0, register1
+
+    def AmplitudeWeightedBlur(temporally filtered phase, amplitude, blur kernel):
+        # Spatially blurs phase, weighted by amplitude. One half of Eq. 23 in tech. report.
+        denominator = Convolve(amplitude, blur kernel)
+        numerator = Convolve(temporally filtered phase.*amplitude, blur kernel)
+        spatially_smooth_temporally_filtered_phase = numerator./denominator
+        return spatially_smooth_temporally_filtered_phase;
+
+    def PhaseShiftCoefficientRealPart(riesz real, riesz x, riesz y, phase cos, phase sin):
+        # Phase shifts a Riesz pyramid coefficient and returns the real part of the
+        # resulting coefficient. The input coefficient is a three
+        # element quaternion. The phase is two element imaginary quaternion.
+        # The phase is exponentiated and then the result is mutiplied by the first
+        # coefficient. All operations are defined on quaternions.
+
+        # Quaternion Exponentiation
+        phase_magnitude = sqrt(phase_cos.ˆ2+phase_sin.ˆ2) # \|v\| in Eq. 11 in tech. report.
+        exp_phase_real = cos(phase_magnitude)
+        exp_phase_x = phase_cos./phase_magnitude.*sin(phase_magnitude)
+        exp_phase_y = phase_sin./phase_magnitude.*sin(phase_magnitude)
+
+        # Quaternion Multiplication (just real part)
+        result = exp_phase_real.*riesz_real - exp_phase_x.*riesz_x - exp_phase_y.*riesz_y
+        return result
 
     def eulerian_magnification(self, vid_data, fps, freq_min, freq_max, amplification, pyramid_levels=4, skip_levels_at_top=2):
         print("Started EVM for " + str(freq_min) + " and " + str(freq_max) + " Hz")
